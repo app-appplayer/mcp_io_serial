@@ -48,10 +48,22 @@ class SerialIoAdapter extends AdapterBase {
 
   static final AdapterManifest _defaultManifest = AdapterManifest(
     adapterId: 'mcp_io_serial',
-    adapterVersion: '0.1.0',
+    adapterVersion: '0.2.0',
     contractVersionRange: '>=0.1.0 <1.0.0',
     displayName: 'Serial Port Adapter',
-    description: 'UART / RS-232 / USB-Serial adapter (byte + line modes).',
+    description:
+        'UART / RS-232 / RS-485 / USB-CDC adapter — raw / line / length-prefixed '
+        'modes, full SerialConfig (baud / data / stop / parity / flow), '
+        'DTR/RTS line control + modem status. Production transport (libserialport '
+        'FFI etc.) injected into SerialTransport; abstract layer ships InMemory.',
+    capabilities: const [
+      CapabilityDescriptor(action: 'serial.write_bytes', safetyClass: SafetyClass.guarded),
+      CapabilityDescriptor(action: 'serial.write_line', safetyClass: SafetyClass.guarded),
+      CapabilityDescriptor(action: 'serial.read_until', safetyClass: SafetyClass.safe),
+      CapabilityDescriptor(action: 'serial.set_dtr', safetyClass: SafetyClass.guarded),
+      CapabilityDescriptor(action: 'serial.set_rts', safetyClass: SafetyClass.guarded),
+      CapabilityDescriptor(action: 'serial.send_break', safetyClass: SafetyClass.guarded),
+    ],
   );
 
   // === Lifecycle ===
@@ -107,42 +119,24 @@ class SerialIoAdapter extends AdapterBase {
   Future<CommandResult> execute(Command command) async {
     try {
       switch (command.action) {
+        // === Legacy actions (BC pre-0.2.0) ===
         case 'send_bytes':
-          final data = (command.args['data'] as List?)?.cast<int>() ?? const [];
-          if (data.isEmpty) {
-            return CommandResult(
-              status: CommandStatus.rejected,
-              error: IoError(
-                code: 'exec.invalid_args',
-                message: 'send_bytes requires non-empty args["data"]',
-                timestamp: DateTime.now(),
-              ),
-            );
-          }
-          await _transport.write(data);
-          return CommandResult(
-            status: CommandStatus.completed,
-            result: {'bytes': data.length},
-          );
+        case 'serial.write_bytes':
+          return await _doWriteBytes(command);
         case 'send_line':
-          final line = command.args['line'] as String?;
-          if (line == null) {
-            return CommandResult(
-              status: CommandStatus.rejected,
-              error: IoError(
-                code: 'exec.invalid_args',
-                message: 'send_line requires args["line"]',
-                timestamp: DateTime.now(),
-              ),
-            );
-          }
-          final terminator = (command.args['terminator'] as String?) ??
-              defaultLineTerminator;
-          await _transport.write(utf8.encode('$line$terminator'));
-          return CommandResult(
-            status: CommandStatus.completed,
-            result: {'bytes': line.length + terminator.length},
-          );
+        case 'serial.write_line':
+          return await _doWriteLine(command);
+
+        // === 0.2.0 capability IDs ===
+        case 'serial.read_until':
+          return await _doReadUntil(command);
+        case 'serial.set_dtr':
+          return await _doSetDtr(command);
+        case 'serial.set_rts':
+          return await _doSetRts(command);
+        case 'serial.send_break':
+          return await _doSendBreak(command);
+
         default:
           return CommandResult(
             status: CommandStatus.rejected,
@@ -160,6 +154,118 @@ class SerialIoAdapter extends AdapterBase {
       );
     }
   }
+
+  // === Capability dispatch helpers ===
+
+  Future<CommandResult> _doWriteBytes(Command command) async {
+    final data = (command.args['data'] as List?)?.cast<int>() ?? const [];
+    if (data.isEmpty) {
+      return _argError('write_bytes requires non-empty args["data"]');
+    }
+    await _transport.write(data);
+    return CommandResult(
+      status: CommandStatus.completed,
+      result: {'bytes': data.length},
+    );
+  }
+
+  Future<CommandResult> _doWriteLine(Command command) async {
+    final line = command.args['line'] as String?;
+    if (line == null) {
+      return _argError('write_line requires args["line"]');
+    }
+    final terminator = (command.args['terminator'] as String?) ??
+        defaultLineTerminator;
+    await _transport.write(utf8.encode('$line$terminator'));
+    return CommandResult(
+      status: CommandStatus.completed,
+      result: {'bytes': line.length + terminator.length},
+    );
+  }
+
+  /// `serial.read_until` accumulates incoming bytes until the supplied
+  /// terminator pattern is observed, or the timeout elapses.
+  /// Args:
+  ///   - `terminator` (String, optional): UTF-8 terminator. Default `\n`.
+  ///   - `timeoutMs` (int, optional): hard deadline. Default 1000ms.
+  /// Returns: `{bytes: List<int>, text: String, matched: bool}`.
+  /// Bytes include the terminator; text is UTF-8 decoded best-effort.
+  Future<CommandResult> _doReadUntil(Command command) async {
+    final terminator = (command.args['terminator'] as String?) ??
+        defaultLineTerminator;
+    final timeoutMs = (command.args['timeoutMs'] as int?) ?? 1000;
+    final termBytes = utf8.encode(terminator);
+    final buffer = <int>[];
+    final completer = Completer<({List<int> bytes, bool matched})>();
+    StreamSubscription<Uint8List>? sub;
+    final timer = Timer(Duration(milliseconds: timeoutMs), () {
+      if (!completer.isCompleted) {
+        completer.complete((bytes: List<int>.from(buffer), matched: false));
+      }
+    });
+    sub = _transport.incoming.listen((chunk) {
+      buffer.addAll(chunk);
+      final idx = _indexOfSubsequence(buffer, termBytes);
+      if (idx >= 0 && !completer.isCompleted) {
+        final upTo = idx + termBytes.length;
+        completer.complete((bytes: buffer.sublist(0, upTo), matched: true));
+      }
+    });
+    final r = await completer.future;
+    timer.cancel();
+    await sub.cancel();
+    return CommandResult(
+      status: CommandStatus.completed,
+      result: {
+        'bytes': r.bytes,
+        'text': utf8.decode(r.bytes, allowMalformed: true),
+        'matched': r.matched,
+      },
+    );
+  }
+
+  Future<CommandResult> _doSetDtr(Command command) async {
+    final active = command.args['active'];
+    if (active is! bool) {
+      return _argError('serial.set_dtr requires bool args["active"]');
+    }
+    await _transport.setDtr(active);
+    return CommandResult(
+      status: CommandStatus.completed,
+      result: {'dtr': active},
+    );
+  }
+
+  Future<CommandResult> _doSetRts(Command command) async {
+    final active = command.args['active'];
+    if (active is! bool) {
+      return _argError('serial.set_rts requires bool args["active"]');
+    }
+    await _transport.setRts(active);
+    return CommandResult(
+      status: CommandStatus.completed,
+      result: {'rts': active},
+    );
+  }
+
+  Future<CommandResult> _doSendBreak(Command command) async {
+    final ms = (command.args['durationMs'] as int?) ?? 250;
+    final duration = Duration(milliseconds: ms);
+    await _transport.sendBreak(duration: duration);
+    return CommandResult(
+      status: CommandStatus.completed,
+      result: {'durationMs': ms},
+    );
+  }
+
+  CommandResult _argError(String reason) => CommandResult(
+        status: CommandStatus.rejected,
+        error: IoError(
+          code: 'exec.invalid_args',
+          message: reason,
+          timestamp: DateTime.now(),
+        ),
+      );
 
   @override
   Stream<PayloadEnvelope> subscribe(TopicSpec spec) {

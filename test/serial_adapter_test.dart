@@ -267,4 +267,103 @@ void main() {
       expect(t.sentFlat(), [1, 2, 3, 4]);
     });
   });
+
+  group('execute — capability dispatch (0.2.0)', () {
+    test('serial.write_bytes routes to write path', () async {
+      final t = InMemorySerialTransport();
+      final a = _adapter(t);
+      await a.connect();
+      final r = await a.execute(const Command(
+        action: 'serial.write_bytes',
+        target: '',
+        args: {'data': [0x41, 0x42]},
+      ));
+      expect(r.status, CommandStatus.completed);
+      expect(t.sentFlat(), [0x41, 0x42]);
+    });
+
+    test('serial.write_line appends terminator', () async {
+      final t = InMemorySerialTransport();
+      final a = _adapter(t);
+      await a.connect();
+      final r = await a.execute(const Command(
+        action: 'serial.write_line',
+        target: '',
+        args: {'line': 'AT'},
+      ));
+      expect(r.status, CommandStatus.completed);
+      expect(utf8.decode(t.sentFlat()), 'AT\n');
+    });
+
+    test('serial.read_until returns bytes when terminator arrives', () async {
+      final t = InMemorySerialTransport();
+      final a = _adapter(t);
+      await a.connect();
+      final fut = a.execute(const Command(
+        action: 'serial.read_until',
+        target: '',
+        args: {'terminator': '\r\n', 'timeoutMs': 500},
+      ));
+      await Future<void>.delayed(Duration.zero);
+      t.inject(utf8.encode('OK\r\n'));
+      final r = await fut;
+      expect(r.status, CommandStatus.completed);
+      expect(r.result?['matched'], isTrue);
+      expect(r.result?['text'], 'OK\r\n');
+    });
+
+    test('serial.read_until reports matched=false on timeout', () async {
+      final t = InMemorySerialTransport();
+      final a = _adapter(t);
+      await a.connect();
+      final r = await a.execute(const Command(
+        action: 'serial.read_until',
+        target: '',
+        args: {'timeoutMs': 30},
+      ));
+      expect(r.status, CommandStatus.completed);
+      expect(r.result?['matched'], isFalse);
+    });
+
+    test('serial.set_dtr / set_rts record control ops', () async {
+      final t = InMemorySerialTransport();
+      final a = _adapter(t);
+      await a.connect();
+      await a.execute(const Command(
+        action: 'serial.set_dtr', target: '', args: {'active': true},
+      ));
+      await a.execute(const Command(
+        action: 'serial.set_rts', target: '', args: {'active': false},
+      ));
+      expect(t.controlOps, [
+        {'op': 'dtr', 'value': true},
+        {'op': 'rts', 'value': false},
+      ]);
+    });
+
+    test('serial.set_dtr rejects non-bool', () async {
+      final t = InMemorySerialTransport();
+      final a = _adapter(t);
+      await a.connect();
+      final r = await a.execute(const Command(
+        action: 'serial.set_dtr', target: '', args: {'active': 1},
+      ));
+      expect(r.status, CommandStatus.rejected);
+      expect(r.error?.code, 'exec.invalid_args');
+    });
+
+    test('serial.send_break records break duration', () async {
+      final t = InMemorySerialTransport();
+      final a = _adapter(t);
+      await a.connect();
+      await a.execute(const Command(
+        action: 'serial.send_break',
+        target: '',
+        args: {'durationMs': 100},
+      ));
+      expect(t.controlOps, hasLength(1));
+      expect(t.controlOps.first['op'], 'break');
+      expect(t.controlOps.first['value'], const Duration(milliseconds: 100));
+    });
+  });
 }

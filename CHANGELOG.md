@@ -1,3 +1,10 @@
+## [0.2.0] - 2026-05-04
+
+- Stream modes (raw / line-delimited / length-prefixed).
+- Production native transport — `libserialport` FFI bindings (Linux /
+  macOS / Windows).
+- Modem-status read (`cts` / `dsr` / `ri` / `cd`) + `IoError` mapping.
+
 ## [0.1.0] - 2026-04-28 - Initial Release
 
 ### Added
